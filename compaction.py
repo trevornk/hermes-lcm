@@ -66,6 +66,42 @@ class CompactionMixin:
             return False
         return tokens >= self.threshold_tokens
 
+    def should_compress_request_pressure(
+        self,
+        messages: List[Dict[str, Any]],
+        prompt_tokens: int,
+    ) -> bool:
+        """Answer pre-API pressure without paying an ingest-side-effect pass.
+
+        A host may include tool schemas and request-only content in
+        ``prompt_tokens``. Once that crosses the LCM threshold, compaction is
+        useful only if raw history outside the protected fresh tail is eligible
+        (or a configured cleanup/debt path can make progress). Provider-proven
+        overflow remains unconditional so recovery never defers a request known
+        not to fit.
+        """
+        if self._should_force_overflow_recovery(
+            observed_tokens=prompt_tokens,
+            messages=messages,
+        ):
+            return True
+        if not self.should_compress(prompt_tokens):
+            return False
+        if self._bypasses_lcm_context_management():
+            return True
+        eligible, _reason = self._leaf_compaction_candidate_status(
+            messages,
+            allow_partial_leaf=bool(self._config.threshold_full_sweep_enabled),
+        )
+        if eligible:
+            return True
+        if self._has_ignored_backlog_outside_fresh_tail(messages):
+            return True
+        return self._should_run_deferred_maintenance(
+            messages,
+            observed_tokens=prompt_tokens,
+        )
+
     def should_compress_preflight(self, messages):
         """Pre-flight check — also ingests messages into the store."""
         self._preflight_cleanup_only_due_to_boundary_cooldown = False
