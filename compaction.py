@@ -386,7 +386,8 @@ class CompactionMixin:
     def compress(self, messages: List[Dict[str, Any]],
                  current_tokens: int = None,
                  focus_topic: Optional[str] = None,
-                 force: bool = False) -> List[Dict[str, Any]]:
+                 force: bool = False,
+                 deadline: Optional[float] = None) -> List[Dict[str, Any]]:
         """Run compaction and leave a terminal public status on every failure."""
         try:
             return self._compress_impl(
@@ -394,6 +395,7 @@ class CompactionMixin:
                 current_tokens=current_tokens,
                 focus_topic=focus_topic,
                 force=force,
+                deadline=deadline,
             )
         except BaseException:
             self._last_compression_status = "error"
@@ -403,7 +405,8 @@ class CompactionMixin:
     def _compress_impl(self, messages: List[Dict[str, Any]],
                        current_tokens: int = None,
                        focus_topic: Optional[str] = None,
-                       force: bool = False) -> List[Dict[str, Any]]:
+                       force: bool = False,
+                       deadline: Optional[float] = None) -> List[Dict[str, Any]]:
         """Main compaction entry point.
 
         1. Ingest any new messages into the store
@@ -509,6 +512,8 @@ class CompactionMixin:
             and estimated_active_tokens >= self.threshold_tokens
         )
         sweep_deadline = time.monotonic() + _THRESHOLD_FULL_SWEEP_MAX_SECONDS
+        if deadline is not None:
+            sweep_deadline = min(sweep_deadline, deadline)
         configured_sweep_target = int(self._config.summary_prefix_target_tokens)
         sweep_target_tokens = max(
             1,
@@ -768,8 +773,11 @@ class CompactionMixin:
 
                 try:
                     summary_kwargs: dict[str, Any] = {"focus_topic": focus_topic}
-                    if threshold_full_sweep_active:
-                        summary_kwargs["deadline"] = sweep_deadline
+                    summary_deadline = sweep_deadline if threshold_full_sweep_active else deadline
+                    if summary_deadline is not None:
+                        summary_kwargs["deadline"] = summary_deadline
+                    if deadline is not None and not threshold_full_sweep_active:
+                        summary_kwargs["host_deadline"] = True
                     (
                         compacted_chunk,
                         source_tokens,
@@ -983,6 +991,8 @@ class CompactionMixin:
                 leaf_compacted_this_turn=True,
                 force_overflow=force_overflow,
                 critical_budget_pressure=critical_budget_pressure,
+                deadline=deadline,
+                host_deadline=deadline is not None,
             )
 
         # Step 7: Assemble new active context

@@ -144,6 +144,18 @@ from . import tools as lcm_tools
 
 logger = logging.getLogger(__name__)
 
+
+def _deadline_before_local_fallback(deadline: Optional[float]) -> Optional[float]:
+    """Reserve a small bounded slice for deterministic L3 before host cancellation."""
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return deadline
+    reserve = min(1.0, max(0.01, remaining * 0.05))
+    return deadline - reserve
+
+
 _ASSERTION_EXTRACTION_PROCESS_SLOT = threading.BoundedSemaphore(1)
 
 class _RollupMaintenanceScheduler:
@@ -1013,6 +1025,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """Whether the most recent compression/preflight decision was a no-op."""
         return self._last_compression_status == "noop"
 
+    def record_rejected_compaction(self) -> None:
+        """Back off after the host rejects an LCM candidate before its commit.
+
+        LCM retains immutable raw rows, so this is not a data-loss verdict. It
+        prevents the same over-threshold boundary from asking the host to rerun
+        a summary immediately; a later retry can assemble from the preserved
+        raw history once new context makes a real reduction possible.
+        """
+        self._last_compression_status = "noop"
+        self._last_compression_noop_reason = "host rejected candidate without material token reduction"
+        self._last_boundary_skip_time = time.time()
+        logger.info("LCM compression candidate rejected by host; boundary cooldown armed")
+
     def _mark_preflight_compression_requested(self) -> bool:
         """Record that preflight found work and clear any stale no-op reason."""
         self._last_compression_status = "pending"
@@ -1677,6 +1702,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         initial_chunk: List[Dict[str, Any]],
         focus_topic: Optional[str] = None,
         deadline: Optional[float] = None,
+        host_deadline: bool = False,
     ) -> tuple[List[Dict[str, Any]], int, str, int, int]:
         attempt_chunk = list(initial_chunk)
         max_attempts = 3
@@ -1695,11 +1721,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             token_budget = min(token_budget, 12000)
 
             try:
+                summary_deadline = _deadline_before_local_fallback(deadline) if host_deadline else deadline
                 timeout_seconds = self._config.summary_timeout_ms / 1000
-                if deadline is not None:
-                    remaining_seconds = deadline - time.monotonic()
+                if summary_deadline is not None:
+                    remaining_seconds = summary_deadline - time.monotonic()
                     if remaining_seconds <= 0:
-                        raise TimeoutError("threshold full sweep time budget exhausted")
+                        raise TimeoutError("host compression deadline exhausted before local fallback")
                     timeout_seconds = min(timeout_seconds, remaining_seconds)
                 summary_text, level = summarize_with_escalation(
                     text=serialized,
@@ -1711,6 +1738,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     circuit_breaker=self._summary_circuit_breaker,
                     spend_guard=self._summary_spend_guard,
                     timeout=timeout_seconds,
+                    deadline=summary_deadline,
                     l2_budget_ratio=self._config.l2_budget_ratio,
                     l3_truncate_tokens=self._config.l3_truncate_tokens,
                     focus_topic=focus_topic or "",
@@ -5563,6 +5591,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         leaf_compacted_this_turn: bool = False,
         force_overflow: bool = False,
         critical_budget_pressure: bool = False,
+        deadline: Optional[float] = None,
+        host_deadline: bool = False,
     ) -> None:
         """Check if any depth level has enough nodes for condensation."""
         self._last_condensation_suppressed_reason = ""
@@ -5606,6 +5636,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             source_tokens, summary_tokens, level = self._condense_summary_nodes(
                 to_condense,
                 focus_topic=focus_topic,
+                deadline=deadline,
+                host_deadline=host_deadline,
             )
             condensed_any = True
 
@@ -5627,6 +5659,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         *,
         focus_topic: Optional[str] = None,
         deadline: Optional[float] = None,
+        host_deadline: bool = False,
     ) -> tuple[int, int, int]:
         """Persist one same-depth condensation and return source/output tokens and level."""
         if not nodes:
@@ -5637,11 +5670,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         combined_text = "\n\n---\n\n".join(node.summary for node in nodes)
         source_tokens = sum(node.token_count for node in nodes)
         token_budget = max(1000, int(source_tokens * 0.40))
+        summary_deadline = _deadline_before_local_fallback(deadline) if host_deadline else deadline
         timeout_seconds = self._config.summary_timeout_ms / 1000
-        if deadline is not None:
-            remaining_seconds = deadline - time.monotonic()
+        if summary_deadline is not None:
+            remaining_seconds = summary_deadline - time.monotonic()
             if remaining_seconds <= 0:
-                raise TimeoutError("threshold full sweep time budget exhausted")
+                raise TimeoutError("host compression deadline exhausted before local fallback")
             timeout_seconds = min(timeout_seconds, remaining_seconds)
         summary_text, level = summarize_with_escalation(
             text=combined_text,
@@ -5653,6 +5687,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             circuit_breaker=self._summary_circuit_breaker,
             spend_guard=self._summary_spend_guard,
             timeout=timeout_seconds,
+            deadline=summary_deadline,
             l2_budget_ratio=self._config.l2_budget_ratio,
             l3_truncate_tokens=self._config.l3_truncate_tokens,
             focus_topic=focus_topic or "",

@@ -333,6 +333,7 @@ def _invoke_summary_llm_chain(
     model: str = "",
     fallback_models: list[str] | tuple[str, ...] | None = None,
     timeout: float | None = None,
+    deadline: float | None = None,
     circuit_breaker: SummaryCircuitBreaker | None = None,
     spend_guard: "SummarySpendGuard | None" = None,
     accepts_result: Callable[[str], bool] | None = None,
@@ -340,6 +341,16 @@ def _invoke_summary_llm_chain(
     chain = _summary_model_chain(model, fallback_models)
     skipped = 0
     for candidate_model in chain:
+        # L1, L2, and every configured fallback share the caller's one wall-clock
+        # budget. Without this gate an unusable L1 can consume its full timeout
+        # and L2 starts a second request that the host has already abandoned.
+        call_timeout = timeout
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.info("LCM summary deadline exhausted before route %s; using deterministic fallback", candidate_model or _DEFAULT_ROUTE_KEY)
+                break
+            call_timeout = remaining if call_timeout is None else min(call_timeout, remaining)
         if circuit_breaker is not None and not circuit_breaker.allows(candidate_model):
             skipped += 1
             logger.warning(
@@ -360,7 +371,7 @@ def _invoke_summary_llm_chain(
                 prompt,
                 max_tokens,
                 model=candidate_model,
-                timeout=timeout,
+                timeout=call_timeout,
             )
         except Exception as exc:
             logger.warning("LLM summarization failed: %s", exc)
@@ -603,6 +614,7 @@ def summarize_with_escalation(
     depth: int = 0,
     model: str = "",
     timeout: float | None = None,
+    deadline: float | None = None,
     l2_budget_ratio: float = 0.50,
     l3_truncate_tokens: int = 512,
     focus_topic: str = "",
@@ -617,6 +629,16 @@ def summarize_with_escalation(
     Guarantees convergence: level 3 is deterministic and always produces
     output shorter than the source.
     """
+    configured_deadline = None
+    if timeout is not None:
+        try:
+            timeout_seconds = float(timeout)
+        except (TypeError, ValueError):
+            timeout_seconds = 0.0
+        if timeout_seconds > 0:
+            configured_deadline = time.monotonic() + timeout_seconds
+    if configured_deadline is not None:
+        deadline = min(deadline, configured_deadline) if deadline is not None else configured_deadline
     # Level 1: detailed summary
     l1_prompt = _build_l1_prompt(
         text,
@@ -633,6 +655,7 @@ def summarize_with_escalation(
         model=model,
         fallback_models=fallback_models,
         timeout=timeout,
+        deadline=deadline,
         circuit_breaker=circuit_breaker,
         spend_guard=spend_guard,
         accepts_result=lambda result: count_tokens(result) < source_tokens,
@@ -659,6 +682,7 @@ def summarize_with_escalation(
         model=model,
         fallback_models=fallback_models,
         timeout=timeout,
+        deadline=deadline,
         circuit_breaker=circuit_breaker,
         spend_guard=spend_guard,
         accepts_result=lambda result: count_tokens(result) < source_tokens,
