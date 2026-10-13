@@ -450,9 +450,27 @@ class MessageStore:
             "observed_at_source",
             "ALTER TABLE messages ADD COLUMN observed_at_source TEXT",
         )
+        # Every write path stamps ``ingested_at``, so after the one-time backfill
+        # no NULL rows exist. An unconditional ``UPDATE ... WHERE ingested_at IS
+        # NULL`` still full-scans ``messages`` inside a write transaction on every
+        # store construction; on a multi-GB lcm.db with several processes
+        # starting at once that queues on the write lock long enough to blow the
+        # host's per-plugin load deadline. A partial index over the
+        # still-unstamped rows keeps the probe O(1) and read-only, and stays
+        # self-healing: any row left NULL (e.g. a crash between ALTER and
+        # backfill) is still found and backfilled on the next start.
         self._conn.execute(
-            "UPDATE messages SET ingested_at = timestamp WHERE ingested_at IS NULL"
+            "CREATE INDEX IF NOT EXISTS idx_messages_ingested_at_pending "
+            "ON messages(store_id) WHERE ingested_at IS NULL"
         )
+        pending = self._conn.execute(
+            "SELECT 1 FROM messages INDEXED BY idx_messages_ingested_at_pending "
+            "WHERE ingested_at IS NULL LIMIT 1"
+        ).fetchone()
+        if pending is not None:
+            self._conn.execute(
+                "UPDATE messages SET ingested_at = timestamp WHERE ingested_at IS NULL"
+            )
 
     # -- Write operations ---------------------------------------------------
 
