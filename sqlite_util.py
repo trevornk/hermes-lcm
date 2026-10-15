@@ -92,6 +92,25 @@ def _chmod_sqlite_artifact_at(
         expected = None
     if expected is not None:
         _validate_sqlite_artifact(path, expected)
+        if stat.S_IMODE(expected.st_mode) == 0o600:
+            # Already private: there is nothing to tighten, so do NOT open it.
+            # POSIX advisory locks are per-process, and close() of ANY
+            # descriptor for a file releases every lock this process holds on
+            # it -- including the locks SQLite's own live connections (the
+            # database, and the -wal/-shm WAL-index locks) rely on. In a
+            # long-lived process that already has this database open, an
+            # open()/close() here lets a sibling process take the exclusive
+            # lock when its connection closes, checkpoint, and unlink the
+            # -wal/-shm out from under this process; later openers then create
+            # a second WAL generation and the file diverges.
+            # (https://www.sqlite.org/howtocorrupt.html, section 2.2.)
+            # The lstat above already proved this is a single-link regular
+            # file, and SQLite creates sidecars with the database's mode, so
+            # in steady state every artifact takes this path and no
+            # descriptor is ever opened. Only an artifact whose mode really
+            # needs correcting (a one-time fix-up, normally before SQLite has
+            # the file open) falls through to the descriptor path below.
+            return True
 
     flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     flags |= getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
