@@ -6,6 +6,8 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ### Fixed
 
+- Build the synthetic PEM redaction fixture at runtime so Hermes plugin security scanning no longer reports an embedded private key.
+- Declare the three registered hooks in plugin.yaml while retaining the 15 public context-engine tool schemas in the manifest.
 - SQLite artifact hardening no longer opens a descriptor on an existing
   `lcm.db`, `-wal`, `-shm` or `-journal`. On POSIX, closing any descriptor for a
   file releases every advisory lock the process holds on it, including its live
