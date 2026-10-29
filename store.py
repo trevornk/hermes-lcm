@@ -354,7 +354,36 @@ class MessageStore:
         self._write_lock = threading.RLock()
         self._init_db()
 
+    # SQLITE_BUSY raised without consulting the busy handler (lock-upgrade
+    # deadlock avoidance, or contention outlasting busy_timeout) used to abort
+    # plugin load, leaving a long-lived process on the built-in compressor for
+    # its lifetime.  Every statement in the open path is idempotent, so a fresh
+    # attempt on a new connection is safe.  Bounded well under the 60s plugin
+    # load deadline.
+    _INIT_LOCK_RETRY_BUDGET_S = 20.0
+
     def _init_db(self):
+        deadline = time.monotonic() + self._INIT_LOCK_RETRY_BUDGET_S
+        delay = 0.25
+        while True:
+            try:
+                self._init_db_once()
+                return
+            except sqlite3.OperationalError as exc:
+                conn = getattr(self, "_conn", None)
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except sqlite3.Error:
+                        pass
+                    self._conn = None
+                if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
+                    raise
+                logger.warning("LCM store open hit a SQLite lock (%s); retrying", exc)
+            time.sleep(delay)
+            delay = min(delay * 2, 2.0)
+
+    def _init_db_once(self):
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
